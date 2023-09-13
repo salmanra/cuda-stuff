@@ -1,6 +1,21 @@
+# order matters
+
+# ignore all files with no extension, ie executables
+# ignore all
+*
+
+# unignore all files with an extension
+!*.*
+
+# unignore all directories
+!*/
+!**/
+
+# ignore all files with these extensions.
 *.i
 *.ii
 *.gpu
 *.ptx
 *.cubin
 *.fatbin
+*.ncu-rep
