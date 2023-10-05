@@ -1,11 +1,17 @@
 #include <iostream>
 #include <math.h>
 #include <string>
+#include <curand.h>
 // #include <thrust/fill.h>
 
-constexpr int TILE_WIDTH = 64; // want this to be geq to block-dim
+constexpr int TILE_WIDTH = 32; // want this to be geq (?) to block-dim
+constexpr int COARSE_FACTOR = 4;
+__global__ void cornerTurnMatMul(float *A, float *B, float *C)
+{
+}
 
-__global__ void CoarseTiledMatMul(float *A, float *B, float *C, int width, int COARSE_FACTOR)
+// this is definitely incorrect on the boundary checks.
+__global__ void CoarseTiledMatMul(float *A, float *B, float *C, int A_width, int A_height, int B_width)
 {
     // One block is responsible for COARSE_FACTOR tiles of output.
     // each thread is responsible for COARSE_FACTOR elts of output.
@@ -46,30 +52,42 @@ __global__ void CoarseTiledMatMul(float *A, float *B, float *C, int width, int C
     }
 
     // 3.
-    for (int i = 0; i < width / TILE_WIDTH; i++)
+    for (int i = 0; i < A_width / TILE_WIDTH; i++)
     {
         // a.
-        A_tile[ty][tx] = A[ROW * width + i * TILE_WIDTH + tx];
+        int A_col = i * TILE_WIDTH + tx;
+        bool A_idx_valid = (A_col < A_width && ROW < A_height);
+        if (A_idx_valid)
+            A_tile[ty][tx] = A[ROW * A_width + A_col];
 
         // b.
         for (int j = 0; j < COARSE_FACTOR; j++)
         {
             // i.
-            B_tile[ty][tx] = B[(i * TILE_WIDTH + ty) * width + COL_START + j * TILE_WIDTH];
+            int B_col = j * TILE_WIDTH + COL_START;
+            int B_row = i * TILE_WIDTH + ty;
+            bool B_idx_valid = (B_col < B_width && B_row < A_width);
+            if (B_idx_valid)
+                B_tile[ty][tx] = B[B_row * B_width + B_col];
 
             __syncthreads(); // don't want to use B_tile before we've written to it
 
             // ii.
-            for (int k = 0; k < TILE_WIDTH; k++)
+            if (A_idx_valid && B_idx_valid)
             {
-                outVals[j] += A_tile[ty][k] + B_tile[k][tx];
+                for (int k = 0; k < TILE_WIDTH; k++)
+                {
+                    outVals[j] += A_tile[ty][k] + B_tile[k][tx];
+                }
             }
             __syncthreads(); // don't want to overwrite B_tile while we're still reading B_tile
         }
     }
     for (int i = 0; i < COARSE_FACTOR; i++)
     {
-        C[ROW * width + COL_START + i * TILE_WIDTH] = outVals[i];
+        int C_col = COL_START + i * TILE_WIDTH;
+        if (C_col < B_width && ROW < A_height)
+            C[ROW * B_width + C_col] = outVals[i];
     }
 }
 
@@ -79,7 +97,7 @@ __global__ void CoarseTiledMatMul(float *A, float *B, float *C, int width, int C
 // let this be a square matrix. I wonder does the optim alg for non-square matmul
 // tile it into squares anyway? Probably that's the best way to tile.
 // assuming tiling is the optimal alg, then you never really do non-square matmul
-__global__ void tiledMatMul(float *A, float *B, float *C, int width)
+__global__ void tiledMatMul(float *A, float *B, float *C, int A_height, int A_width, int B_width)
 {
     // 1. declare shared mem tiles (one for each input matrix)
     // 2. get row and col of output matrix for this thread
@@ -116,20 +134,29 @@ __global__ void tiledMatMul(float *A, float *B, float *C, int width)
     // 2.
     int COL = blockDim.x * blockIdx.x + tx;
     int ROW = blockDim.y * blockIdx.y + ty;
-
+    if (ROW >= A_height || COL >= B_width)
+    {
+        return;
+    }
     // let the tile dimensions be the same as the block dimensions.
     //
     float outVal = 0.0;
     // 3.
-    for (int i = 0; i < width / TILE_WIDTH; i++)
+    for (int i = 0; i < A_width / TILE_WIDTH; i++)
     {
         // a.
         // mem coalescing is done on a warp-level. mem coalescing is a statement about what the hardware does on a warp level
         // accesses to A are clearly coalesced (cont. on tx)
         // accesses to B have the same ty val within a warp (assuming tile-width >= 32)
         // ergo accesses to B are coalesced (cont. on COL)
-        A_tile[ty][tx] = A[ROW * width + i * TILE_WIDTH + tx]; // row is const, col within a tile is const, col by tile is not const
-        B_tile[ty][tx] = B[(i * TILE_WIDTH + ty) * width + COL];
+        int A_col = i * TILE_WIDTH + tx;
+        int B_row = i * TILE_WIDTH + ty;
+        if (A_col >= A_width || B_row >= A_width)
+        {
+            return;
+        }
+        A_tile[ty][tx] = A[ROW * A_width + A_col]; // row is const, col within a tile is const, col by tile is not const
+        B_tile[ty][tx] = B[B_row * B_width + COL];
         // b.
         __syncthreads();
         // now matmul the tiles
@@ -141,7 +168,7 @@ __global__ void tiledMatMul(float *A, float *B, float *C, int width)
         __syncthreads();
     }
     // 4.
-    C[ROW * width + COL] = outVal;
+    C[ROW * B_width + COL] = outVal;
 }
 
 //  row matmul sucks!!! from the perspective of a single thread, access to A is
@@ -230,6 +257,7 @@ void naiveMatmul(float *A, float *B, float *C, int i, int j, int k)
     {
         for (int col = 0; col < k; col++)
         {
+            float tmp = 0.0f;
             for (int y = 0; y < j; y++)
             {
                 // j is the shared dim,
@@ -239,8 +267,9 @@ void naiveMatmul(float *A, float *B, float *C, int i, int j, int k)
                 // of note: j to index in A is to jump from row to row
                 // (there are j elts in a row of A)
                 // k fills this role for B (there are k elts in a row of B)
-                C[row * k + col] += A[row * j + y] * B[y * k + col];
+                tmp += A[row * j + y] * B[y * k + col];
             }
+            C[row * k + col] = tmp;
         }
     }
 }
@@ -251,13 +280,16 @@ void initMat(float *mat, int h, int w)
     {
         for (int j = 0; j < h; j++)
         {
-            mat[j * w + i] = (float)(j * w + i) / (i * j);
+            // mat[j * w + i] = (float)j;
+            // mat[j * w + i] = (float)(j * w + i) / (i * j + 1);
+            mat[j * w + i] = 3.0f;
         }
     }
 }
 
 int main()
 {
+    // today I want to test tiled, coarsened, non-sqaure matmul
     int i, j, k;
     float *a, *b, *c, *d_a, *d_b, *d_c;
 
@@ -285,21 +317,59 @@ int main()
     cudaMemcpy(d_b, b, j * k * sizeof(float), cudaMemcpyHostToDevice);
 
     // TODO: investigate thrust::fill. I do want to learn how to memset in cuda, but for now let's just copy c over
-    cudaMemcpy(d_c, c, i * k * sizeof(float), cudaMemcpyHostToDevice);
+    // cudaMemcpy(d_c, c, i * k * sizeof(float), cudaMemcpyHostToDevice);
 
-    int blockLength = TILE_WIDTH / 2; // as you can see, we can set blockDim to be less than TILE_WIDTH
+    int blockLength = TILE_WIDTH;
     dim3 threadsPerBlock(blockLength, blockLength, 1);
-    dim3 gridShape((i + blockLength - 1) / blockLength, (k + blockLength - 1) / blockLength, 1);
+    dim3 gridShape((k + blockLength - 1) / blockLength, (i + blockLength - 1) / blockLength, 1);
 
-    matmul<<<gridShape, threadsPerBlock>>>(d_a, d_b, d_c, i, j, k);
+    std::cout << "grid x: " << gridShape.x << "grid y: " << gridShape.y << std::endl;
+    std::cout << "block x: " << threadsPerBlock.x << "blok y: " << threadsPerBlock.y << std::endl;
 
-    printf("off to the races");
+    tiledMatMul<<<gridShape, threadsPerBlock>>>(d_a, d_b, d_c, i, j, k);
+    // matmul<<<gridShape, threadsPerBlock>>>(d_a, d_b, d_c, i, j, k);
+    // CoarseTiledMatMul<<<gridShape, threadsPerBlock>>>(d_a, d_b, d_c, i, j, k);
+
+    cudaDeviceSynchronize();
     // verify C
     // to veryify correctness, I guess we can serially calculate A@B and compare
+    naiveMatmul(a, b, c, i, j, k);
+
+    float *res;
+    res = (float *)malloc(i * k * sizeof(float));
+    cudaMemcpy(res, d_c, i * k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float maxError = 0.0f;
+    int rescount = 0;
+    int ccount = 0;
+    for (int u = 0; u < i; u++)
+    {
+        for (int w = 0; w < k; w++)
+        {
+            maxError = max(maxError, abs(res[u * i + w] - c[u * i + w]));
+            if (abs(res[u * i + w] - c[u * i + w]) > 0.0000001)
+            {
+                rescount++;
+                // std::cout << u << ' ' << w << std::endl;
+
+                // std::cout << res[u * i + w] << ' ' << c[u * i + w] << std::endl;
+            }
+            // if (abs(c[u * i + w] - 360.0f) > 0.00001)
+            // {
+            //     ccount++;
+            // }
+        }
+        // std::cout << res[u] << std::endl;
+        // std::cout << c[u] << std::endl;
+    }
+    std::cout << "Max error: " << maxError << std::endl;
+    std::cout << "Bad Res: " << rescount << std::endl;
+    // std::cout << "Bad c: " << ccount << std::endl;
 
     free(a);
     free(b);
     free(c);
+    free(res);
 
     cudaFree(d_a);
     cudaFree(d_b);
