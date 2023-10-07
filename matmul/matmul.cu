@@ -132,8 +132,8 @@ __global__ void tiledMatMul(float *A, float *B, float *C, int A_height, int A_wi
 
     // output indices of this thread
     // 2.
-    int COL = blockDim.x * blockIdx.x + tx;
-    int ROW = blockDim.y * blockIdx.y + ty;
+    int COL = TILE_WIDTH * blockIdx.x + tx;
+    int ROW = TILE_WIDTH * blockIdx.y + ty;
     if (ROW >= A_height || COL >= B_width)
     {
         return;
@@ -142,7 +142,7 @@ __global__ void tiledMatMul(float *A, float *B, float *C, int A_height, int A_wi
     //
     float outVal = 0.0;
     // 3.
-    for (int i = 0; i < A_width / TILE_WIDTH; i++)
+    for (int i = 0; i < (A_width + TILE_WIDTH - 1) / TILE_WIDTH; i++)
     {
         // a.
         // mem coalescing is done on a warp-level. mem coalescing is a statement about what the hardware does on a warp level
@@ -151,7 +151,7 @@ __global__ void tiledMatMul(float *A, float *B, float *C, int A_height, int A_wi
         // ergo accesses to B are coalesced (cont. on COL)
         int A_col = i * TILE_WIDTH + tx;
         int B_row = i * TILE_WIDTH + ty;
-        if (A_col >= A_width || B_row >= A_width)
+        if (A_col >= A_width || B_row >= A_height)
         {
             return;
         }
@@ -294,9 +294,9 @@ int main()
     float *a, *b, *c, *d_a, *d_b, *d_c;
 
     // do some stuff with the constants
-    i = 300;
-    j = 400;
-    k = 500;
+    i = 200;
+    j = 200;
+    k = 200;
 
     a = (float *)malloc(i * j * sizeof(float));
     b = (float *)malloc(j * k * sizeof(float));
@@ -308,6 +308,7 @@ int main()
 
     initMat(a, i, j);
     initMat(b, j, k);
+
     // a thing to remember about memset is that it fills as many bytes with the given value,
     // not as many "array elts" (it's not an array, just a pointer to some bytes!).
     // thus setting to 0 is easy because float(0) is four bytes each with the value 0
@@ -320,11 +321,11 @@ int main()
     // cudaMemcpy(d_c, c, i * k * sizeof(float), cudaMemcpyHostToDevice);
 
     int blockLength = TILE_WIDTH;
-    dim3 threadsPerBlock(blockLength, blockLength, 1);
-    dim3 gridShape((k + blockLength - 1) / blockLength, (i + blockLength - 1) / blockLength, 1);
+    dim3 threadsPerBlock(blockLength, blockLength);
+    dim3 gridShape((k + blockLength - 1) / blockLength, (i + blockLength - 1) / blockLength);
 
-    std::cout << "grid x: " << gridShape.x << "grid y: " << gridShape.y << std::endl;
-    std::cout << "block x: " << threadsPerBlock.x << "blok y: " << threadsPerBlock.y << std::endl;
+    std::cout << "grid x: " << gridShape.x << " grid y: " << gridShape.y << std::endl;
+    std::cout << "block x: " << threadsPerBlock.x << " blok y: " << threadsPerBlock.y << std::endl;
 
     tiledMatMul<<<gridShape, threadsPerBlock>>>(d_a, d_b, d_c, i, j, k);
     // matmul<<<gridShape, threadsPerBlock>>>(d_a, d_b, d_c, i, j, k);
@@ -342,18 +343,18 @@ int main()
     float maxError = 0.0f;
     int rescount = 0;
     int ccount = 0;
+
     for (int u = 0; u < i; u++)
     {
         for (int w = 0; w < k; w++)
         {
-            maxError = max(maxError, abs(res[u * i + w] - c[u * i + w]));
-            if (abs(res[u * i + w] - c[u * i + w]) > 0.0000001)
+            maxError = max(maxError, abs(res[u * k + w] - c[u * k + w]));
+            if (abs(res[u * k + w] - c[u * k + w]) > 0.0000001)
             {
                 rescount++;
                 // std::cout << u << ' ' << w << std::endl;
-
-                // std::cout << res[u * i + w] << ' ' << c[u * i + w] << std::endl;
             }
+            // std::cout << res[u * k + w] << ' ' << c[u * k + w] << std::endl;
             // if (abs(c[u * i + w] - 360.0f) > 0.00001)
             // {
             //     ccount++;
@@ -365,6 +366,8 @@ int main()
     std::cout << "Max error: " << maxError << std::endl;
     std::cout << "Bad Res: " << rescount << std::endl;
     // std::cout << "Bad c: " << ccount << std::endl;
+    // std::cout << res[0] << std::endl;
+    // std::cout << c[0] << std::endl;
 
     free(a);
     free(b);
