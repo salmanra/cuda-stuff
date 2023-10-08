@@ -3,10 +3,8 @@
 # ignore all files with no extension, ie executables
 # ignore all
 *
-
 # unignore all files with an extension
 !*.*
-
 # unignore all directories
 !*/
 !**/
@@ -19,5 +17,5 @@
 *.cubin
 *.fatbin
 *.ncu-rep
-
+*.out
 ##
